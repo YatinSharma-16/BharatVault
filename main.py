@@ -1,0 +1,1325 @@
+import os
+import re
+import io
+import json
+import threading
+import traceback
+import sqlite3
+import hashlib
+from datetime import datetime, timedelta
+from typing import Optional, List, Dict, Any
+
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Query
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from jose import JWTError, jwt
+from pydantic import BaseModel
+
+try:
+    import cv2
+    import numpy as np
+    CV2_AVAILABLE = True
+except ImportError:
+    CV2_AVAILABLE = False
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
+
+# ----------------- OCR engine selection -----------------
+# Choose the engine with an environment variable - no code change needed:
+#   PowerShell:   $env:OCR_ENGINE="tesseract"      (or "paddle")
+#   cmd.exe:      set OCR_ENGINE=tesseract
+#   Mac/Linux:    export OCR_ENGINE=tesseract
+# Default = PaddleOCR.
+OCR_ENGINE = os.getenv("OCR_ENGINE", "paddle").strip().lower()
+if OCR_ENGINE not in ("paddle", "tesseract"):
+    print(f"[OCR] Unknown OCR_ENGINE '{OCR_ENGINE}' - using 'paddle'")
+    OCR_ENGINE = "paddle"
+
+PADDLE_LANG = os.getenv("PADDLE_OCR_LANG", "en")        # later: "hi" (Hindi / Devanagari), etc.
+TESSERACT_LANG = os.getenv("TESSERACT_LANG", "eng")     # later: "eng+hin"
+PADDLE_DOC_ORIENTATION = os.getenv("PADDLE_DOC_ORIENTATION", "0") == "1"   # auto-fix rotated scans (extra small model)
+PADDLE_ENABLE_MKLDNN = os.getenv("PADDLE_ENABLE_MKLDNN", "0") == "1"       # off = safest on a fresh Windows setup
+
+# Skip PaddleX's start-up "can I reach the model host" check (can stall on slow networks)
+os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+
+OCR_AVAILABLE = False
+OCR_INIT_ERROR = None
+
+if OCR_ENGINE == "tesseract":
+    try:
+        import pytesseract
+        possible_paths = [
+            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+            r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\Tesseract-OCR\tesseract.exe")
+        ]
+        for p in possible_paths:
+            if os.path.exists(p):
+                pytesseract.pytesseract.tesseract_cmd = p
+                break
+        OCR_AVAILABLE = True
+    except ImportError as e:
+        OCR_INIT_ERROR = e
+else:
+    try:
+        from paddleocr import PaddleOCR
+        OCR_AVAILABLE = True
+    except Exception as e:   # ImportError, or a native-library error from paddle itself
+        OCR_INIT_ERROR = e
+
+print(f"[OCR] engine={OCR_ENGINE}  available={OCR_AVAILABLE}" + (f"  error={OCR_INIT_ERROR!r}" if OCR_INIT_ERROR else ""))
+
+try:
+    from PyPDF2 import PdfReader
+    PDF_TEXT_AVAILABLE = True
+except ImportError:
+    PDF_TEXT_AVAILABLE = False
+
+try:
+    from pdf2image import convert_from_bytes
+    PDF2IMAGE_AVAILABLE = True
+except ImportError:
+    PDF2IMAGE_AVAILABLE = False
+
+try:
+    import pymupdf as fitz  # PyMuPDF - renders PDF pages without needing Poppler
+    FITZ_AVAILABLE = True
+except ImportError:
+    try:
+        import fitz  # older PyMuPDF releases
+        FITZ_AVAILABLE = True
+    except ImportError:
+        FITZ_AVAILABLE = False
+
+SECRET_KEY = "bharat-vault-secure-token-secret-key-2026"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
+UPLOAD_DIR = "uploads"
+DB_FILE = "terra_digitize.db"
+
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/token", auto_error=False)
+
+app = FastAPI(title="BharatVault API", version="8.5")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return hash_password(plain_password) == hashed_password
+
+def get_db():
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+def init_db():
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        full_name TEXT NOT NULL,
+        hashed_password TEXT NOT NULL,
+        role TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS records (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        filename TEXT NOT NULL,
+        file_path TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'Pending Verification',
+        raw_text TEXT,
+        owner_name TEXT,
+        seller_name TEXT,
+        buyer_name TEXT,
+        share_hissa TEXT,
+        survey_number TEXT,
+        khasra_number TEXT,
+        khata_number TEXT,
+        plot_number TEXT,
+        property_id TEXT,
+        total_area REAL,
+        sub_plot_areas TEXT,
+        land_use TEXT,
+        boundaries_desc TEXT,
+        village TEXT,
+        tehsil TEXT,
+        district TEXT,
+        registration_date TEXT,
+        mutation_date TEXT,
+        serial_number TEXT,
+        consideration_amount REAL,
+        confidence_scores TEXT,
+        validation_flags TEXT,
+        document_type TEXT,
+        uploaded_by TEXT,
+        ocr_quality REAL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS audit_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        role TEXT NOT NULL,
+        action TEXT NOT NULL,
+        details TEXT,
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+    conn.commit()
+
+    # --- Safe migrations: add public-submission columns to pre-existing DBs ---
+    def _safe_add_column(table, coldef):
+        try:
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {coldef}")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
+    _safe_add_column("users", "phone_number TEXT")
+    _safe_add_column("records", "submission_source TEXT DEFAULT 'Officer'")
+    _safe_add_column("records", "submitted_by_user_id INTEGER")
+    _safe_add_column("records", "verification_deadline TEXT")
+    _safe_add_column("records", "escalated INTEGER DEFAULT 0")
+    _safe_add_column("records", "has_conflict INTEGER DEFAULT 0")
+    _safe_add_column("records", "verified_by TEXT")
+    _safe_add_column("records", "verified_at TEXT")
+    _safe_add_column("records", "verification_checklist TEXT")
+    _safe_add_column("records", "verification_notes TEXT")
+
+    cursor.execute("SELECT COUNT(*) FROM users")
+    if cursor.fetchone()[0] == 0:
+        cursor.execute(
+            "INSERT INTO users (username, full_name, hashed_password, role) VALUES (?, ?, ?, ?)",
+            ("admin", "System Administrator", hash_password("admin123"), "Admin")
+        )
+        conn.commit()
+    conn.close()
+
+init_db()
+
+PUBLIC_VERIFICATION_SLA_DAYS = 10
+PUBLIC_AWAITING_STATUS = "Awaiting Physical Verification"
+
+
+
+def log_action(conn: sqlite3.Connection, username: str, role: str, action: str, details: str = ""):
+    conn.execute(
+        "INSERT INTO audit_logs (user_id, role, action, details) VALUES (?, ?, ?, ?)",
+        (username, role, action, details)
+    )
+    conn.commit()
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+def get_current_user(
+    token: Optional[str] = Depends(oauth2_scheme),
+    token_query: Optional[str] = Query(None, alias="token"),
+    conn: sqlite3.Connection = Depends(get_db)
+):
+    actual_token = token or token_query
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Session invalid or expired",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    if not actual_token:
+        raise credentials_exception
+    try:
+        payload = jwt.decode(actual_token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        role: str = payload.get("role")
+        if username is None or role is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+
+    user = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    if user is None:
+        raise credentials_exception
+    return {"username": user["username"], "full_name": user["full_name"], "role": user["role"], "id": user["id"]}
+
+# ----------------- OCR & Preprocessing -----------------
+
+def preprocess_image_for_ocr(image_bytes: bytes) -> "Image.Image":
+    if not CV2_AVAILABLE:
+        return Image.open(io.BytesIO(image_bytes))
+    nparr = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if img is None:
+        return Image.open(io.BytesIO(image_bytes))
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
+    if w < 1500:
+        scale = 1500.0 / w
+        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+    denoised = cv2.bilateralFilter(gray, 9, 75, 75)
+    thresh = cv2.adaptiveThreshold(denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 15)
+    return Image.fromarray(thresh)
+
+# ---- PaddleOCR ----
+
+_paddle_engine = None
+_paddle_lock = threading.Lock()
+
+def _get_paddle_engine():
+    """Create the PaddleOCR model once and reuse it (first call downloads/loads the models)."""
+    global _paddle_engine
+    if _paddle_engine is None:
+        with _paddle_lock:
+            if _paddle_engine is None:
+                try:
+                    _paddle_engine = PaddleOCR(
+                        lang=PADDLE_LANG,
+                        use_doc_orientation_classify=PADDLE_DOC_ORIENTATION,
+                        use_doc_unwarping=False,
+                        use_textline_orientation=False,
+                        enable_mkldnn=PADDLE_ENABLE_MKLDNN,
+                    )
+                except TypeError:
+                    # very old PaddleOCR 2.x signature
+                    _paddle_engine = PaddleOCR(lang=PADDLE_LANG, use_angle_cls=True)
+    return _paddle_engine
+
+def preprocess_image_for_paddle(image_bytes: bytes):
+    """PaddleOCR's detector/recognizer are trained on natural images, so unlike Tesseract they do
+    better on the original colour image than on a hard-binarised one. Only upscale small images."""
+    if CV2_AVAILABLE:
+        img = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
+        if img is None:
+            raise ValueError("Could not decode image")
+        h, w = img.shape[:2]
+        if w < 1200:
+            scale = 1200.0 / w
+            img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        return img
+    import numpy as _np
+    return _np.array(Image.open(io.BytesIO(image_bytes)).convert("RGB"))[:, :, ::-1].copy()
+
+def _paddle_items(results):
+    """Normalise PaddleOCR output (3.x `predict` or 2.x `ocr`) to [(x1, y1, x2, y2, text, score)]."""
+    items = []
+    for res in results or []:
+        if res is None:
+            continue
+        if hasattr(res, "get") and res.get("rec_texts") is not None:           # PaddleOCR 3.x
+            texts = res["rec_texts"]
+            scores = res.get("rec_scores")
+            if scores is None:
+                scores = [1.0] * len(texts)
+            polys = res.get("rec_polys")
+            if polys is None:
+                polys = res.get("dt_polys")
+            for poly, text, score in zip(polys, texts, scores):
+                xs = [float(pt[0]) for pt in poly]
+                ys = [float(pt[1]) for pt in poly]
+                items.append((min(xs), min(ys), max(xs), max(ys), text, float(score)))
+        elif isinstance(res, list):                                             # PaddleOCR 2.x
+            for line in res:
+                poly, (text, score) = line[0], line[1]
+                xs = [float(pt[0]) for pt in poly]
+                ys = [float(pt[1]) for pt in poly]
+                items.append((min(xs), min(ys), max(xs), max(ys), text, float(score)))
+    return items
+
+def _assemble_lines(items) -> str:
+    """Rebuild reading-order text from detected boxes: boxes on the same visual row are joined
+    left-to-right (a big horizontal gap becomes a newline, so 'District: X   Tehsil: Y' stays separable)."""
+    items = [it for it in items if it[4] and it[4].strip()]
+    if not items:
+        return ""
+    heights = sorted(it[3] - it[1] for it in items)
+    med_h = heights[len(heights) // 2] or 1.0
+    items.sort(key=lambda it: (it[1] + it[3]) / 2)
+
+    rows = []
+    for it in items:
+        yc = (it[1] + it[3]) / 2
+        if rows and abs(yc - rows[-1]["yc"]) <= 0.6 * med_h:
+            row = rows[-1]
+            row["items"].append(it)
+            row["yc"] = (row["yc"] * (len(row["items"]) - 1) + yc) / len(row["items"])
+        else:
+            rows.append({"yc": yc, "items": [it]})
+
+    lines = []
+    for row in rows:
+        ordered = sorted(row["items"], key=lambda it: it[0])
+        line = ordered[0][4].strip()
+        for prev, cur in zip(ordered, ordered[1:]):
+            sep = "\n" if (cur[0] - prev[2]) > 3 * med_h else " "
+            line += sep + cur[4].strip()
+        lines.append(line)
+    return "\n".join(lines)
+
+def _paddle_read(image_bytes: bytes):
+    """Returns (text, mean_confidence)."""
+    engine = _get_paddle_engine()
+    img = preprocess_image_for_paddle(image_bytes)
+    try:
+        results = engine.predict(img)
+    except AttributeError:          # PaddleOCR 2.x
+        results = engine.ocr(img, cls=True)
+    items = _paddle_items(results)
+    if not items:
+        return "", 0.0
+    mean_conf = sum(it[5] for it in items) / len(items)
+    return _assemble_lines(items), mean_conf
+
+# ---- engine dispatch ----
+
+def _ocr_image_bytes(image_bytes: bytes, retry_sparse: bool = True):
+    """Run the selected engine on ONE image. Returns (text, mean_confidence or None)."""
+    if OCR_ENGINE == "paddle":
+        return _paddle_read(image_bytes)
+    processed_pil = preprocess_image_for_ocr(image_bytes)
+    text = pytesseract.image_to_string(processed_pil, lang=TESSERACT_LANG, config=r"--oem 3 --psm 6")
+    if retry_sparse and len(text.strip()) < 50:
+        # Sparse result - retry with default page segmentation before giving up
+        text = pytesseract.image_to_string(processed_pil, lang=TESSERACT_LANG)
+    return text, None
+
+def _render_pdf_pages(file_content: bytes, dpi: int) -> List[bytes]:
+    """PDF -> one PNG (bytes) per page. PyMuPDF first (no Poppler install needed), pdf2image as fallback."""
+    if FITZ_AVAILABLE:
+        doc = fitz.open(stream=file_content, filetype="pdf")
+        try:
+            return [page.get_pixmap(dpi=dpi).tobytes("png") for page in doc]
+        finally:
+            doc.close()
+    pages = []
+    for page_img in convert_from_bytes(file_content, dpi=dpi):
+        buf = io.BytesIO()
+        page_img.save(buf, format="PNG")
+        pages.append(buf.getvalue())
+    return pages
+
+def _log_ocr_error(where: str):
+    print(f"[OCR] {OCR_ENGINE} failed during {where}:")
+    traceback.print_exc()
+
+def run_ocr(file_content: bytes, filename: str) -> (str, float):
+    ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+    text = ""
+    quality = 0.90
+
+    # If uploading text file, read directly without dummy replacement
+    if ext == "txt":
+        return file_content.decode("utf-8", errors="ignore").strip(), 1.0
+
+    if ext in ("png", "jpg", "jpeg", "bmp", "tiff", "tif"):
+        if OCR_AVAILABLE:
+            try:
+                text, conf = _ocr_image_bytes(file_content)
+                if len(text.strip()) < 50:
+                    quality = 0.55
+                elif conf is not None:
+                    quality = round(min(0.99, conf), 2)   # real engine confidence (PaddleOCR)
+                else:
+                    quality = 0.90
+            except Exception:
+                _log_ocr_error("image upload")
+                text = ""
+                quality = 0.0
+        else:
+            quality = 0.0
+
+    elif ext == "pdf":
+        if PDF_TEXT_AVAILABLE:
+            try:
+                reader = PdfReader(io.BytesIO(file_content))
+                text = "\n".join((page.extract_text() or "") for page in reader.pages)
+            except Exception:
+                text = ""
+
+        # Most land-record scans are image-only PDFs (no embedded text layer), so
+        # PyPDF2 alone returns empty/near-empty text. Fall back to rendering each
+        # page as an image and running the same OCR pipeline used for uploads.
+        if len(text.strip()) < 50 and (FITZ_AVAILABLE or PDF2IMAGE_AVAILABLE) and OCR_AVAILABLE:
+            try:
+                dpi = 200 if OCR_ENGINE == "paddle" else 300   # Paddle is heavier on CPU; 200 dpi is plenty
+                ocr_parts = []
+                for page_png in _render_pdf_pages(file_content, dpi=dpi):
+                    page_text, _ = _ocr_image_bytes(page_png, retry_sparse=False)
+                    ocr_parts.append(page_text)
+                ocr_text = "\n".join(ocr_parts).strip()
+                if len(ocr_text) > len(text.strip()):
+                    text = ocr_text
+                    quality = 0.75  # scanned-PDF OCR fallback - slightly lower confidence than a native text layer
+                elif text.strip():
+                    quality = 0.90
+            except Exception:
+                _log_ocr_error("scanned-PDF fallback")
+        elif text.strip():
+            quality = 0.95  # native PDF text layer - most reliable source
+
+        if not text.strip():
+            quality = 0.0
+
+    return text.strip(), quality
+
+def _warm_up_paddle():
+    """Load PaddleOCR in the background at start-up so the first upload isn't slow
+    (the very first run also downloads the models once - needs internet)."""
+    try:
+        _get_paddle_engine()
+        print("[OCR] PaddleOCR models loaded and ready.")
+    except Exception:
+        print("[OCR] PaddleOCR failed to load:")
+        traceback.print_exc()
+
+if OCR_ENGINE == "paddle" and OCR_AVAILABLE:
+    threading.Thread(target=_warm_up_paddle, daemon=True).start()
+
+KNOWN_DISTRICTS = ["Jaipur", "Jodhpur", "Udaipur", "Kota", "Ajmer", "Alwar", "Bikaner", "Bharatpur", "Sikar", "Chomu", "Amer"]
+ 
+# Words that can get captured by the identifier regexes below when they match only the
+# field's own label (e.g. "Khasra No" with the value on the next token, or a colon landing
+# right after "Khasra" so the optional "No."/"Number" text falls inside the capture group
+# instead of being consumed as the label). Real Khasra/Khata/Plot/Property IDs always contain
+# a digit, so any match that is purely one of these label words - or has no digit at all - is
+# not a real value and should be discarded rather than stored.
+_IDENTIFIER_LABEL_WORDS = {"no", "no.", "number", "n0", "n0.", "na", "n/a", "-"}
+ 
+def _clean_identifier_match(raw: Optional[str]) -> Optional[str]:
+    if not raw:
+        return None
+    val = raw.strip()
+    if not val:
+        return None
+    if val.lower().rstrip(".") in _IDENTIFIER_LABEL_WORDS:
+        return None
+    if not re.search(r"[0-9]", val):
+        return None
+    return val
+
+def clean_extracted_name(raw: str) -> str:
+    raw = re.sub(r"(?i)\b(s/o|d/o|w/o|aged|r/o|village|resident of|late|son of|daughter of|wife of)\b.*", "", raw)
+    return re.sub(r"[\.,;:_~]", " ", raw).strip().title()
+
+def normalize_date(raw: str) -> Optional[str]:
+    raw = raw.strip()
+    for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%d %b %Y", "%d %B %Y", "%d-%m-%y", "%d/%m/%y"):
+        try:
+            return datetime.strptime(raw, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return None
+
+def extract_land_identity(text: str):
+    result = {
+        "document_type": "Sale Deed",
+        "serial_number": None,
+        "district": None,
+        "tehsil": None,
+        "village": None,
+        "khasra_number": None,
+        "khata_number": None,
+        "plot_number": None,
+        "property_id": None,
+        "survey_number": None,
+        "owner_name": None,
+        "seller_name": None,
+        "buyer_name": None,
+        "share_hissa": "1/1 (Full)",
+        "total_area": None,
+        "sub_plot_areas": [],
+        "land_use": "Agricultural",
+        "boundaries_desc": None,
+        "consideration_amount": None,
+        "registration_date": None,
+        "mutation_date": None,
+    }
+    confidence: Dict[str, float] = {}
+    t = text or ""
+    upper = t.upper()
+
+    if "KHATAUNI" in upper or "KHASRA" in upper:
+        result["document_type"] = "Khasra-Khatauni Record"
+    elif "RECORD OF RIGHTS" in upper or re.search(r"\bROR\b", upper):
+        result["document_type"] = "Record of Rights (RoR)"
+    elif "PATTA" in upper:
+        result["document_type"] = "Patta / Lease"
+
+    # Serial Number
+    m = re.search(r"(?:SERIAL|STAMP)\s*(?:NO|N0|\.)?\s*[:\.\-]?\s*([A-Z0-9\-\/]+)", t, re.IGNORECASE)
+    if m:
+        result["serial_number"] = m.group(1).strip()
+        confidence["serial_number"] = 0.95
+
+    # Registration & Execution Dates
+    date_patterns = [
+        r"Registration\s*Date\s*[:\-]?\s*([0-9]{1,2}[\/\-\.][0-9]{1,2}[\/\-\.][0-9]{2,4})",
+        r"executed\s+on\s*[:\-]?\s*([0-9]{1,2}[\/\-\.][0-9]{1,2}[\/\-\.][0-9]{2,4})",
+        r"DATE\s*[:\-]?\s*([0-9]{1,2}\s+[A-Za-z]{3,9}\s+[0-9]{4})",
+        r"DATE\s*[:\-]?\s*([0-9]{1,2}[\/\-\.][0-9]{1,2}[\/\-\.][0-9]{2,4})",
+    ]
+    for dp in date_patterns:
+        m = re.search(dp, t, re.IGNORECASE)
+        if m:
+            parsed_d = normalize_date(m.group(1))
+            if parsed_d:
+                result["registration_date"] = parsed_d
+                confidence["registration_date"] = 0.96
+                break
+
+    # Mutation Date
+    m = re.search(r"Mutation\s*Date\s*[:\-]?\s*([0-9]{1,2}[\/\-\.][0-9]{1,2}[\/\-\.][0-9]{2,4})", t, re.IGNORECASE)
+    if m:
+        result["mutation_date"] = normalize_date(m.group(1))
+        confidence["mutation_date"] = 0.90
+
+    # Seller & Buyer
+    m = re.search(r"(?:VENDOR|SELLER)\s*(?:\(Seller\))?\s*[:\-]?\s*([A-Za-z\s\.]+?)(?:,|\n|S\/O|D\/O|AGED|R\/O|Son of|Wife of)", t, re.IGNORECASE)
+    if m:
+        result["seller_name"] = clean_extracted_name(m.group(1))
+        confidence["seller_name"] = 0.92
+
+    m = re.search(r"(?:VENDEE|BUYER|RECORDED\s*HOLDER|ALLOTTEE)\s*(?:\([^\)]+\))?\s*[:\-]?\s*([A-Za-z\s\.]+?)(?:,|\n|S\/O|D\/O|AGED|R\/O|Son of|Wife of)", t, re.IGNORECASE)
+    if m:
+        result["buyer_name"] = clean_extracted_name(m.group(1))
+        confidence["buyer_name"] = 0.93
+
+    result["owner_name"] = result["buyer_name"] or result["seller_name"]
+    confidence["owner_name"] = confidence.get("buyer_name", 0.92)
+
+    # Share / Hissa
+    m = re.search(r"(?:Share|Hissa)\s*[:\-]?\s*([0-9\/\sA-Za-z\(\)]+)", t, re.IGNORECASE)
+    if m:
+        result["share_hissa"] = m.group(1).strip()
+        confidence["share_hissa"] = 0.95
+
+    # Location
+    m = re.search(r"(?:District)\s*[:\-]?\s*([A-Za-z]+)", t, re.IGNORECASE)
+    if m:
+        result["district"] = m.group(1).strip().title()
+        confidence["district"] = 0.98
+
+    m = re.search(r"(?:Tehsil)\s*[:\-]?\s*([A-Za-z]+)", t, re.IGNORECASE)
+    if m:
+        result["tehsil"] = m.group(1).strip().title()
+        confidence["tehsil"] = 0.95
+
+    m = re.search(r"(?:Village|Locality|Urban Locality)\s*[:\-]?\s*([A-Za-z0-9\s]+?)(?:,|\n|$)", t, re.IGNORECASE)
+    if m:
+        result["village"] = m.group(1).strip().title()
+        confidence["village"] = 0.95
+
+    # Identifiers
+    m = re.search(r"Khasra\s*(?:No\.?|Number)?\s*[:\-]?\s*([0-9\/\-A-Za-z]+)", t, re.IGNORECASE)
+    khasra_val = _clean_identifier_match(m.group(1)) if m else None
+    if khasra_val:
+        result["khasra_number"] = khasra_val
+        confidence["khasra_number"] = 0.94
+
+    m = re.search(r"Khata\s*(?:No\.?|Number)?\s*[:\-]?\s*([0-9A-Za-z\/\-]+)", t, re.IGNORECASE)
+    khata_val = _clean_identifier_match(m.group(1)) if m else None
+    if khata_val:
+        result["khata_number"] = khata_val
+        confidence["khata_number"] = 0.91
+
+    m = re.search(r"Plot\s*(?:No\.?|Number)?\s*[:\-]?\s*([0-9A-Za-z\/\-]+)", t, re.IGNORECASE)
+    plot_val = _clean_identifier_match(m.group(1)) if m else None
+    if plot_val:
+        result["plot_number"] = plot_val
+        confidence["plot_number"] = 0.90
+
+    m = re.search(r"Property\s*ID\s*[:\-]?\s*([0-9A-Za-z\-\/_]+)", t, re.IGNORECASE)
+    property_val = _clean_identifier_match(m.group(1)) if m else None
+    if property_val:
+        result["property_id"] = property_val
+        confidence["property_id"] = 0.92
+
+    # Area & Sub-plots
+    m = re.search(r"(?:Area|Total\s*Area)\s*[:\-]?\s*([0-9\.]+)\s*(?:bigha|acre|hectare|sq)?", t, re.IGNORECASE)
+    if m:
+        try:
+            result["total_area"] = float(m.group(1))
+            confidence["total_area"] = 0.95
+        except ValueError:
+            pass
+
+    sub_matches = re.findall(r"Sub-plot\s*[A-Za-z0-9]*\s*=\s*([0-9\.]+)", t, re.IGNORECASE)
+    if sub_matches:
+        result["sub_plot_areas"] = [float(x) for x in sub_matches]
+
+    # Land use
+    m = re.search(r"Land\s*Use(?:\s*[\/\(A-Za-z\)]*)?\s*[:\-]?\s*([A-Za-z\s\(\)]+?)(?:,|\n|$)", t, re.IGNORECASE)
+    if m:
+        result["land_use"] = m.group(1).strip().title()
+        confidence["land_use"] = 0.93
+
+    # Boundaries
+    m = re.search(r"Boundaries\s*[:\-]?\s*([^\n\r]+)", t, re.IGNORECASE)
+    if m:
+        result["boundaries_desc"] = m.group(1).strip()
+        confidence["boundaries_desc"] = 0.90
+
+    # Consideration amount
+    m = re.search(r"(?:Consideration|Amount|Sale\s+Value|Price)\s*[:\-]?\s*(?:Rs\.?|INR)?\s*([0-9,]+(?:\.[0-9]{2})?)", t, re.IGNORECASE)
+    if m:
+        try:
+            val_str = m.group(1).replace(",", "").strip()
+            result["consideration_amount"] = float(val_str)
+            confidence["consideration_amount"] = 0.98
+        except ValueError:
+            pass
+
+    return result, confidence
+
+def run_validation_rules(data: dict, conn: sqlite3.Connection, current_record_id: Optional[int] = None) -> List[str]:
+    flags = []
+
+    # Rule 1: Chronological Order (Mutation cannot precede Registration)
+    reg_date_str = data.get("registration_date")
+    mut_date_str = data.get("mutation_date")
+    if reg_date_str and mut_date_str:
+        try:
+            reg_d = datetime.strptime(reg_date_str, "%Y-%m-%d")
+            mut_d = datetime.strptime(mut_date_str, "%Y-%m-%d")
+            if mut_d < reg_d:
+                flags.append(f"Timeline Anomaly: Mutation date ({mut_date_str}) precedes registration date ({reg_date_str})")
+        except ValueError:
+            pass
+
+    # Rule 2: Sub-plot Sum Reconciliation
+    total_area = data.get("total_area")
+    sub_plots = data.get("sub_plot_areas") or []
+    if total_area is not None and len(sub_plots) > 0:
+        sub_sum = round(sum(sub_plots), 2)
+        if round(float(total_area), 2) != sub_sum:
+            flags.append(f"Area Sum Mismatch: Total area ({total_area} Bigha) != sum of sub-plots ({sub_sum} Bigha)")
+
+    # Rule 3: Missing Mandatory Location Identifier
+    if not data.get("district"):
+        flags.append("Missing Mandatory Location Identifier: 'District' is unassigned")
+
+    # Rule 4: Duplicate Stamp Serial Check (colliding only against OTHER records)
+    serial = data.get("serial_number")
+    if serial:
+        query = "SELECT id FROM records WHERE serial_number = ?"
+        params = [serial]
+        if current_record_id:
+            query += " AND id != ?"
+            params.append(current_record_id)
+        dup = conn.execute(query, params).fetchall()
+        if dup:
+            flags.append(f"Duplicate Serial Warning: Serial '{serial}' already registered under record #{dup[0]['id']}")
+
+    # Rule 5: Ownership Chain Continuity (Chain-of-Title fraud/error detection)
+    khasra = data.get("khasra_number")
+    village = data.get("village")
+    district = data.get("district")
+    seller = (data.get("seller_name") or "").strip().lower()
+    reg_date = data.get("registration_date")
+    if khasra and village and district and seller:
+        query = """
+            SELECT id, buyer_name, registration_date FROM records
+            WHERE LOWER(TRIM(khasra_number)) = LOWER(TRIM(?))
+              AND LOWER(TRIM(village)) = LOWER(TRIM(?))
+              AND LOWER(TRIM(district)) = LOWER(TRIM(?))
+        """
+        params = [khasra, village, district]
+        if current_record_id:
+            query += " AND id != ?"
+            params.append(current_record_id)
+        prior_records = conn.execute(query, params).fetchall()
+
+        # Narrow down to the transaction immediately preceding this one chronologically
+        candidates = []
+        for pr in prior_records:
+            pr_date = pr["registration_date"]
+            if reg_date and pr_date:
+                try:
+                    if datetime.strptime(pr_date, "%Y-%m-%d") < datetime.strptime(reg_date, "%Y-%m-%d"):
+                        candidates.append(pr)
+                except ValueError:
+                    candidates.append(pr)
+            elif not reg_date:
+                candidates.append(pr)
+
+        if candidates:
+            candidates.sort(key=lambda p: p["registration_date"] or "", reverse=True)
+            latest_prior = candidates[0]
+            prior_buyer = (latest_prior["buyer_name"] or "").strip().lower()
+            if prior_buyer and prior_buyer != seller:
+                flags.append(
+                    f"Chain of Title Break: Seller '{data.get('seller_name')}' does not match the "
+                    f"previously recorded owner '{latest_prior['buyer_name']}' (Record #{latest_prior['id']})"
+                )
+
+    return flags
+
+# ----------------- Core API Endpoints -----------------
+
+def find_conflicting_records(conn: sqlite3.Connection, khasra, village, district, exclude_id: Optional[int] = None):
+    """Find other still-active (non-Verified) records claiming the exact same land parcel."""
+    if not (khasra and village and district):
+        return []
+    query = """
+        SELECT id, submitted_by_user_id, submission_source, status FROM records
+        WHERE LOWER(TRIM(khasra_number)) = LOWER(TRIM(?))
+          AND LOWER(TRIM(village)) = LOWER(TRIM(?))
+          AND LOWER(TRIM(district)) = LOWER(TRIM(?))
+          AND status != 'Verified'
+    """
+    params = [khasra, village, district]
+    if exclude_id:
+        query += " AND id != ?"
+        params.append(exclude_id)
+    return conn.execute(query, params).fetchall()
+
+def _flag_existing_conflict(conn: sqlite3.Connection, record_id: int, message: str):
+    row = conn.execute("SELECT validation_flags FROM records WHERE id = ?", (record_id,)).fetchone()
+    if not row:
+        return
+    existing = json.loads(row["validation_flags"]) if row["validation_flags"] else []
+    if message not in existing:
+        existing.append(message)
+    conn.execute("UPDATE records SET has_conflict = 1, validation_flags = ? WHERE id = ?", (json.dumps(existing), record_id))
+
+def _ingest_record(
+    conn: sqlite3.Connection,
+    file_bytes: bytes,
+    filename: str,
+    uploader_username: str,
+    submission_source: str = "Officer",
+    submitted_by_user_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Shared pipeline: save file -> OCR -> extract -> validate -> conflict-check -> insert."""
+    file_location = os.path.join(UPLOAD_DIR, filename)
+    with open(file_location, "wb") as f:
+        f.write(file_bytes)
+
+    raw_text, ocr_quality = run_ocr(file_bytes, filename)
+    extracted, field_confidence = extract_land_identity(raw_text)
+    flags = run_validation_rules(extracted, conn)
+
+    verification_deadline = None
+    has_conflict = 0
+
+    if submission_source == "Public":
+        # Public self-submissions are NEVER auto-verified — they always need a physical, on-site
+        # check by a Revenue Officer before they can enter the official registry.
+        final_status = PUBLIC_AWAITING_STATUS
+        verification_deadline = (datetime.utcnow() + timedelta(days=PUBLIC_VERIFICATION_SLA_DAYS)).strftime("%Y-%m-%d")
+
+        conflicts = find_conflicting_records(conn, extracted.get("khasra_number"), extracted.get("village"), extracted.get("district"))
+        if conflicts:
+            has_conflict = 1
+            conflict_ids = ", ".join(f"#{c['id']}" for c in conflicts)
+            flags.append(
+                f"Competing Claim Detected: This land is also claimed in record(s) {conflict_ids} — "
+                f"both submissions must be physically verified before either can be approved."
+            )
+            for c in conflicts:
+                _flag_existing_conflict(
+                    conn, c["id"],
+                    "Competing Claim Detected: A newer submission also claims this same land — "
+                    "both must be physically re-verified before either proceeds."
+                )
+    else:
+        # Officer/Clerk ingested documents: clean docs auto-verify, anything flagged needs review
+        final_status = "Verified" if len(flags) == 0 else "Flagged"
+
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO records (
+            filename, file_path, status, raw_text, owner_name, seller_name, buyer_name,
+            share_hissa, document_type, serial_number, survey_number, khasra_number, khata_number,
+            plot_number, property_id, total_area, sub_plot_areas, land_use, boundaries_desc,
+            village, tehsil, district, consideration_amount, registration_date, mutation_date,
+            confidence_scores, validation_flags, uploaded_by, ocr_quality,
+            submission_source, submitted_by_user_id, verification_deadline, has_conflict
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        filename,
+        file_location,
+        final_status,
+        raw_text,
+        extracted["owner_name"],
+        extracted["seller_name"],
+        extracted["buyer_name"],
+        extracted["share_hissa"],
+        extracted["document_type"],
+        extracted["serial_number"],
+        extracted["survey_number"],
+        extracted["khasra_number"],
+        extracted["khata_number"],
+        extracted["plot_number"],
+        extracted["property_id"],
+        extracted["total_area"],
+        json.dumps(extracted["sub_plot_areas"]),
+        extracted["land_use"],
+        extracted["boundaries_desc"],
+        extracted["village"],
+        extracted["tehsil"],
+        extracted["district"],
+        extracted["consideration_amount"],
+        extracted["registration_date"],
+        extracted["mutation_date"],
+        json.dumps(field_confidence),
+        json.dumps(flags),
+        uploader_username,
+        ocr_quality,
+        submission_source,
+        submitted_by_user_id,
+        verification_deadline,
+        has_conflict,
+    ))
+    record_id = cursor.lastrowid
+    conn.commit()
+
+    return {"id": record_id, "filename": filename, "status": final_status, "flags": flags, "has_conflict": bool(has_conflict)}
+
+# ----------------- Core API Endpoints -----------------
+
+@app.post("/api/auth/token")
+def login(form_data: OAuth2PasswordRequestForm = Depends(), conn: sqlite3.Connection = Depends(get_db)):
+    user = conn.execute("SELECT * FROM users WHERE username = ?", (form_data.username,)).fetchone()
+    if not user or not verify_password(form_data.password, user["hashed_password"]):
+        raise HTTPException(status_code=400, detail="Invalid username or password")
+
+    token = create_access_token({"sub": user["username"], "role": user["role"]})
+    log_action(conn, user["username"], user["role"], "LOGIN", "User logged in")
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "role": user["role"],
+        "username": user["username"],
+        "full_name": user["full_name"]
+    }
+
+class PublicRegisterPayload(BaseModel):
+    full_name: str
+    username: str
+    password: str
+    phone_number: Optional[str] = None
+
+@app.post("/api/auth/register-public")
+def register_public(payload: PublicRegisterPayload, conn: sqlite3.Connection = Depends(get_db)):
+    """Public self-service signup — no Admin has to manually create an account for every citizen."""
+    username = payload.username.strip()
+    if not username or not payload.password or not payload.full_name.strip():
+        raise HTTPException(status_code=400, detail="Full name, username and password are required")
+    existing = conn.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()
+    if existing:
+        raise HTTPException(status_code=400, detail="That username is already taken")
+    conn.execute(
+        "INSERT INTO users (username, full_name, hashed_password, role, phone_number) VALUES (?, ?, ?, ?, ?)",
+        (username, payload.full_name.strip(), hash_password(payload.password), "Citizen", (payload.phone_number or "").strip())
+    )
+    conn.commit()
+    log_action(conn, username, "Citizen", "PUBLIC_REGISTER", f"Public citizen self-registered: {payload.full_name.strip()}")
+    return {"message": "Account created. You can now sign in and submit your land record for verification."}
+
+@app.post("/api/records/upload")
+async def upload_documents(
+    files: List[UploadFile] = File(...),
+    current_user: dict = Depends(get_current_user),
+    conn: sqlite3.Connection = Depends(get_db)
+):
+    if current_user["role"] == "Citizen":
+        raise HTTPException(status_code=403, detail="Citizens must submit land records through the Public Submission portal.")
+
+    processed = []
+    for file in files:
+        contents = await file.read()
+        if not contents:
+            continue
+        result = _ingest_record(conn, contents, file.filename, current_user["username"], submission_source="Officer")
+        log_action(conn, current_user["username"], current_user["role"], "UPLOAD",
+                   f"Ingested record #{result['id']} ({file.filename}) - Result: {result['status']}")
+        processed.append(result)
+
+    return {"message": f"Processed {len(processed)} document(s)", "records": processed}
+
+@app.post("/api/public/submit")
+async def submit_public_record(
+    files: List[UploadFile] = File(...),
+    current_user: dict = Depends(get_current_user),
+    conn: sqlite3.Connection = Depends(get_db)
+):
+    if current_user["role"] != "Citizen":
+        raise HTTPException(status_code=403, detail="Only citizen accounts can use the public submission portal.")
+
+    processed = []
+    for file in files:
+        contents = await file.read()
+        if not contents:
+            continue
+        result = _ingest_record(
+            conn, contents, file.filename, current_user["username"],
+            submission_source="Public", submitted_by_user_id=current_user["id"]
+        )
+        log_action(conn, current_user["username"], current_user["role"], "PUBLIC_SUBMIT",
+                   f"Citizen submitted record #{result['id']} ({file.filename}) for physical verification")
+        processed.append(result)
+
+    return {"message": f"Submitted {len(processed)} document(s) for physical verification.", "records": processed}
+
+@app.get("/api/public/my-submissions")
+def my_public_submissions(current_user: dict = Depends(get_current_user), conn: sqlite3.Connection = Depends(get_db)):
+    if current_user["role"] != "Citizen":
+        raise HTTPException(status_code=403, detail="Citizen accounts only.")
+    rows = conn.execute("SELECT * FROM records WHERE submitted_by_user_id = ? ORDER BY id DESC", (current_user["id"],)).fetchall()
+    result = []
+    for r in rows:
+        rec = dict(r)
+        rec["validation_flags"] = json.loads(rec["validation_flags"]) if rec["validation_flags"] else []
+        rec["confidence_scores"] = json.loads(rec["confidence_scores"]) if rec["confidence_scores"] else {}
+        rec["verification_checklist"] = json.loads(rec["verification_checklist"]) if rec.get("verification_checklist") else {}
+        result.append(rec)
+    return result
+
+@app.get("/api/officer/public-queue")
+def public_queue(current_user: dict = Depends(get_current_user), conn: sqlite3.Connection = Depends(get_db)):
+    if current_user["role"] not in ["Admin", "Revenue Officer"]:
+        raise HTTPException(status_code=403, detail="Access denied.")
+
+    # Auto-escalate anything that missed its physical-verification SLA
+    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+    overdue = conn.execute("""
+        SELECT id FROM records
+        WHERE submission_source = 'Public' AND status = ?
+          AND escalated = 0 AND verification_deadline IS NOT NULL AND verification_deadline < ?
+    """, (PUBLIC_AWAITING_STATUS, today_str)).fetchall()
+    for row in overdue:
+        conn.execute("UPDATE records SET escalated = 1 WHERE id = ?", (row["id"],))
+        log_action(conn, "SYSTEM", "System", "ESCALATION",
+                   f"Record #{row['id']} missed its physical-verification deadline and was escalated to senior authority review.")
+    if overdue:
+        conn.commit()
+
+    rows = conn.execute("""
+        SELECT r.*, u.full_name AS submitter_name, u.phone_number AS submitter_phone
+        FROM records r LEFT JOIN users u ON r.submitted_by_user_id = u.id
+        WHERE r.submission_source = 'Public'
+        ORDER BY r.escalated DESC, r.verification_deadline ASC, r.id DESC
+    """).fetchall()
+
+    result = []
+    for r in rows:
+        rec = dict(r)
+        rec["validation_flags"] = json.loads(rec["validation_flags"]) if rec["validation_flags"] else []
+        rec["confidence_scores"] = json.loads(rec["confidence_scores"]) if rec["confidence_scores"] else {}
+        rec["verification_checklist"] = json.loads(rec["verification_checklist"]) if rec.get("verification_checklist") else {}
+        result.append(rec)
+    return result
+
+class VerificationChecklistPayload(BaseModel):
+    checks: Dict[str, bool]
+    notes: Optional[str] = None
+
+@app.post("/api/officer/verify-checklist/{record_id}")
+def verify_checklist(
+    record_id: int,
+    payload: VerificationChecklistPayload,
+    current_user: dict = Depends(get_current_user),
+    conn: sqlite3.Connection = Depends(get_db)
+):
+    if current_user["role"] not in ["Admin", "Revenue Officer"]:
+        raise HTTPException(status_code=403, detail="Access denied.")
+    record = conn.execute("SELECT * FROM records WHERE id = ?", (record_id,)).fetchone()
+    if not record:
+        raise HTTPException(status_code=404, detail="Record not found")
+
+    checks = payload.checks or {}
+    all_confirmed = len(checks) > 0 and all(checks.values())
+
+    existing_flags = json.loads(record["validation_flags"]) if record["validation_flags"] else []
+    kept_flags = [f for f in existing_flags if not f.startswith("Competing Claim") and not f.startswith("Physical Verification")]
+
+    if all_confirmed:
+        new_status = "Verified"
+        verified_by = current_user["full_name"]
+        verified_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+        kept_flags = []
+    else:
+        new_status = "Flagged"
+        verified_by = None
+        verified_at = None
+        unchecked = [k for k, v in checks.items() if not v]
+        kept_flags.append(
+            f"Physical Verification Incomplete: field(s) not confirmed on-site — {', '.join(unchecked) if unchecked else 'none confirmed'}"
+        )
+
+    conn.execute("""
+        UPDATE records SET
+            status = ?, verified_by = ?, verified_at = ?, verification_checklist = ?,
+            verification_notes = ?, validation_flags = ?, escalated = 0
+        WHERE id = ?
+    """, (new_status, verified_by, verified_at, json.dumps(checks), payload.notes or "", json.dumps(kept_flags), record_id))
+    conn.commit()
+
+    log_action(conn, current_user["username"], current_user["role"], "PHYSICAL_VERIFICATION",
+               f"Record #{record_id} physically verified by {current_user['full_name']} — Result: {new_status}")
+
+    return {"message": "Verification recorded", "status": new_status, "verified_by": verified_by}
+
+@app.get("/api/records")
+def list_records(current_user: dict = Depends(get_current_user), conn: sqlite3.Connection = Depends(get_db)):
+    if current_user["role"] == "Citizen":
+        raise HTTPException(status_code=403, detail="Citizens cannot access the internal registry. Use /api/public/my-submissions.")
+    records = conn.execute("SELECT * FROM records ORDER BY id DESC").fetchall()
+    role = current_user["role"]
+
+    sanitized = []
+    for r in records:
+        rec = dict(r)
+        rec["validation_flags"] = json.loads(rec["validation_flags"]) if rec["validation_flags"] else []
+        rec["confidence_scores"] = json.loads(rec["confidence_scores"]) if rec["confidence_scores"] else {}
+        if role == "Clerk":
+            rec["owner_name"] = "[RESTRICTED - OFFICER ONLY]"
+            rec["seller_name"] = "[RESTRICTED]"
+            rec["buyer_name"] = "[RESTRICTED]"
+            rec["survey_number"] = "[RESTRICTED]"
+            rec["khasra_number"] = "[RESTRICTED]"
+            rec["khata_number"] = "[RESTRICTED]"
+            rec["serial_number"] = "[RESTRICTED]"
+            rec["consideration_amount"] = None
+            rec["raw_text"] = "[RESTRICTED]"
+        sanitized.append(rec)
+    return sanitized
+
+@app.get("/api/timeline/chains")
+def get_ownership_chains(current_user: dict = Depends(get_current_user), conn: sqlite3.Connection = Depends(get_db)):
+    rows = conn.execute("""
+        SELECT id, khasra_number, village, district, seller_name, buyer_name, registration_date, status
+        FROM records
+        WHERE khasra_number IS NOT NULL AND TRIM(khasra_number) != ''
+          AND village IS NOT NULL AND TRIM(village) != ''
+        ORDER BY id
+    """).fetchall()
+
+    groups: Dict[tuple, List[dict]] = {}
+    for r in rows:
+        rec = dict(r)
+        key = (
+            (rec["khasra_number"] or "").strip().lower(),
+            (rec["village"] or "").strip().lower(),
+            (rec["district"] or "").strip().lower(),
+        )
+        groups.setdefault(key, []).append(rec)
+
+    def sort_key(rec):
+        d = rec.get("registration_date")
+        if d:
+            try:
+                return (0, datetime.strptime(d, "%Y-%m-%d"))
+            except ValueError:
+                pass
+        return (1, datetime.min)
+
+    chains = []
+    for key, recs in groups.items():
+        if len(recs) < 2:
+            continue  # only show land parcels with an actual resale history
+        recs_sorted = sorted(recs, key=sort_key)
+
+        hops = []
+        has_break = False
+        for i, rec in enumerate(recs_sorted):
+            continuity_ok = True
+            if i > 0:
+                prev_buyer = (recs_sorted[i - 1].get("buyer_name") or "").strip().lower()
+                cur_seller = (rec.get("seller_name") or "").strip().lower()
+                if prev_buyer and cur_seller and prev_buyer != cur_seller:
+                    continuity_ok = False
+                    has_break = True
+            hops.append({
+                "record_id": rec["id"],
+                "seller": rec.get("seller_name") or "Unknown",
+                "buyer": rec.get("buyer_name") or "Unknown",
+                "date": rec.get("registration_date"),
+                "status": rec.get("status"),
+                "continuity_ok": continuity_ok,
+            })
+
+        chains.append({
+            "khasra_number": recs_sorted[0]["khasra_number"],
+            "village": recs_sorted[0]["village"],
+            "district": recs_sorted[0]["district"],
+            "hops": hops,
+            "total_transfers": len(hops),
+            "has_break": has_break,
+            "last_updated_id": max(r["id"] for r in recs_sorted),
+        })
+
+    chains.sort(key=lambda c: c["last_updated_id"], reverse=True)
+    chains = chains[:8]
+
+    if current_user["role"] == "Clerk":
+        for c in chains:
+            for h in c["hops"]:
+                h["seller"] = "[RESTRICTED]"
+                h["buyer"] = "[RESTRICTED]"
+
+    return chains
+
+@app.get("/api/records/{record_id}/file")
+def get_record_file(
+    record_id: int,
+    current_user: dict = Depends(get_current_user),
+    conn: sqlite3.Connection = Depends(get_db)
+):
+    record = conn.execute("SELECT file_path, filename, submitted_by_user_id FROM records WHERE id = ?", (record_id,)).fetchone()
+    if not record:
+        raise HTTPException(status_code=404, detail="Record not found")
+    if current_user["role"] == "Citizen" and record["submitted_by_user_id"] != current_user["id"]:
+        raise HTTPException(status_code=403, detail="You can only view files from your own submissions.")
+    if not os.path.exists(record["file_path"]):
+        raise HTTPException(status_code=404, detail="File missing from storage")
+    return FileResponse(record["file_path"], filename=record["filename"])
+
+class RecordUpdatePayload(BaseModel):
+    district: Optional[str] = None
+    tehsil: Optional[str] = None
+    village: Optional[str] = None
+    khasra_number: Optional[str] = None
+    khata_number: Optional[str] = None
+    plot_number: Optional[str] = None
+    property_id: Optional[str] = None
+    owner_name: str
+    seller_name: Optional[str] = None
+    buyer_name: Optional[str] = None
+    share_hissa: Optional[str] = None
+    total_area: Optional[float] = None
+    land_use: Optional[str] = None
+    boundaries_desc: Optional[str] = None
+    consideration_amount: Optional[float] = None
+    registration_date: Optional[str] = None
+    mutation_date: Optional[str] = None
+    serial_number: Optional[str] = None
+    document_type: Optional[str] = None
+    status: str
+
+@app.put("/api/records/{record_id}")
+def update_record(
+    record_id: int,
+    payload: RecordUpdatePayload,
+    current_user: dict = Depends(get_current_user),
+    conn: sqlite3.Connection = Depends(get_db)
+):
+    if current_user["role"] not in ["Admin", "Revenue Officer"]:
+        raise HTTPException(status_code=403, detail="Permission denied")
+
+    flags = run_validation_rules(payload.dict(), conn, current_record_id=record_id)
+    final_status = payload.status
+
+    conn.execute("""
+        UPDATE records SET
+            district = ?, tehsil = ?, village = ?, khasra_number = ?, khata_number = ?,
+            plot_number = ?, property_id = ?, owner_name = ?, seller_name = ?, buyer_name = ?,
+            share_hissa = ?, total_area = ?, land_use = ?, boundaries_desc = ?,
+            consideration_amount = ?, registration_date = ?, mutation_date = ?, serial_number = ?,
+            document_type = ?, status = ?, validation_flags = ?
+        WHERE id = ?
+    """, (
+        payload.district,
+        payload.tehsil,
+        payload.village,
+        payload.khasra_number,
+        payload.khata_number,
+        payload.plot_number,
+        payload.property_id,
+        payload.owner_name,
+        payload.seller_name,
+        payload.buyer_name,
+        payload.share_hissa,
+        payload.total_area,
+        payload.land_use,
+        payload.boundaries_desc,
+        payload.consideration_amount,
+        payload.registration_date,
+        payload.mutation_date,
+        payload.serial_number,
+        payload.document_type or "Sale Deed",
+        final_status,
+        json.dumps([] if final_status == "Verified" else flags),
+        record_id
+    ))
+    conn.commit()
+    log_action(conn, current_user["username"], current_user["role"], "VERIFY/UPDATE", f"Record #{record_id} saved as {final_status}")
+    return {"message": "Record saved successfully", "status": final_status}
+
+class CreateUserPayload(BaseModel):
+    username: str
+    full_name: str
+    password: str
+    role: str
+
+@app.post("/api/users")
+def create_new_user(payload: CreateUserPayload, current_user: dict = Depends(get_current_user), conn: sqlite3.Connection = Depends(get_db)):
+    if current_user["role"] != "Admin":
+        raise HTTPException(status_code=403, detail="Access denied. Admins only.")
+    existing = conn.execute("SELECT id FROM users WHERE username = ?", (payload.username,)).fetchone()
+    if existing:
+        raise HTTPException(status_code=400, detail="Username already exists")
+    conn.execute(
+        "INSERT INTO users (username, full_name, hashed_password, role) VALUES (?, ?, ?, ?)",
+        (payload.username.strip(), payload.full_name.strip(), hash_password(payload.password), payload.role)
+    )
+    conn.commit()
+    log_action(conn, current_user["username"], current_user["role"], "USER_CREATE", f"Created user '{payload.username}' ({payload.role})")
+    return {"message": "User registered successfully"}
+
+@app.get("/api/users")
+def list_users(current_user: dict = Depends(get_current_user), conn: sqlite3.Connection = Depends(get_db)):
+    if current_user["role"] != "Admin":
+        raise HTTPException(status_code=403, detail="Access denied.")
+    return [dict(u) for u in conn.execute("SELECT id, username, full_name, role, created_at FROM users ORDER BY id DESC").fetchall()]
+
+@app.delete("/api/users/{user_id}")
+def delete_user(user_id: int, current_user: dict = Depends(get_current_user), conn: sqlite3.Connection = Depends(get_db)):
+    if current_user["role"] != "Admin":
+        raise HTTPException(status_code=403, detail="Access denied.")
+    conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    conn.commit()
+    log_action(conn, current_user["username"], current_user["role"], "USER_DELETE", f"Deleted user ID {user_id}")
+    return {"message": "User deleted"}
+
+@app.get("/api/audit-logs")
+def get_audit_logs(current_user: dict = Depends(get_current_user), conn: sqlite3.Connection = Depends(get_db)):
+    if current_user["role"] != "Admin":
+        raise HTTPException(status_code=403, detail="Access denied.")
+    return [dict(row) for row in conn.execute("SELECT * FROM audit_logs ORDER BY id DESC LIMIT 100").fetchall()]
+
+@app.get("/")
+def serve_frontend():
+    if os.path.exists("index.html"):
+        return FileResponse("index.html")
+    raise HTTPException(status_code=404, detail="index.html not found next to main.py")
+
+if os.path.isdir("static"):
+    app.mount("/static", StaticFiles(directory="static"), name="static")
