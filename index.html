@@ -332,6 +332,7 @@
 
     .tips-card ul { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 0.85rem; }
     .tips-card li { display: flex; gap: 0.7rem; align-items: flex-start; font-size: 0.85rem; color: #475569; line-height: 1.45; }
+    .tips-card li .txt { flex: 1; min-width: 0; }
     .tips-card li .bullet {
       width: 26px; height: 26px; border-radius: 8px; flex-shrink: 0; display: flex; align-items: center;
       justify-content: center; font-size: 0.85rem; background: var(--primary-light); color: var(--primary); margin-top: 0.05rem;
@@ -372,6 +373,7 @@
     }
     .upload-side-note h4 { color: white; margin: 0 0 0.6rem; font-size: 0.95rem; }
     .upload-side-note .step { display: flex; gap: 0.65rem; margin-bottom: 0.8rem; }
+    .upload-side-note .step .txt { flex: 1; min-width: 0; }
     .upload-side-note .step .num {
       width: 22px; height: 22px; border-radius: 50%; background: rgba(255,255,255,0.12);
       display: flex; align-items: center; justify-content: center; font-size: 0.72rem; font-weight: 700; color: white; flex-shrink: 0;
@@ -710,9 +712,9 @@
           <div class="card tips-card">
             <h3>🧭 Verification Playbook</h3>
             <ul>
-              <li><span class="bullet">1</span> Ingest scanned deeds from the <b>Upload Files</b> tab — OCR runs automatically and fields are auto-classified.</li>
-              <li><span class="bullet">2</span> Records with validation issues land in <b>Flagged Documents</b> below — open <em>Double-Check</em> to compare against the original soft copy.</li>
-              <li><span class="bullet">3</span> Correct any low-confidence field (highlighted in red), then <b>Approve as Verified</b> or keep it <b>Flagged</b> for further review.</li>
+              <li><span class="bullet">1</span><span class="txt">Ingest scanned deeds from the <b>Upload Files</b> tab — OCR runs automatically and fields are auto-classified.</span></li>
+              <li><span class="bullet">2</span><span class="txt">Records with validation issues land in <b>Flagged Documents</b> below — open <em>Double-Check</em> to compare against the original soft copy.</span></li>
+              <li><span class="bullet">3</span><span class="txt">Correct any low-confidence field (highlighted in red), then <b>Approve as Verified</b> or keep it <b>Flagged</b> for further review.</span></li>
             </ul>
           </div>
         </div>
@@ -770,10 +772,10 @@
           </div>
           <div class="upload-side-note">
             <h4>⚙️ What happens next</h4>
-            <div class="step"><span class="num">1</span> Each file is scanned with OCR to extract text and identify quality.</div>
-            <div class="step"><span class="num">2</span> Land identity fields (owner, khasra, area, dates...) are parsed out automatically.</div>
-            <div class="step"><span class="num">3</span> Duplicate & consistency checks run — clean records auto-verify, flagged ones need review.</div>
-            <div class="step"><span class="num">4</span> Everything lands in your <b>Dashboard</b>, ready to double-check.</div>
+            <div class="step"><span class="num">1</span><div class="txt">Each file is scanned with OCR to extract text and identify quality.</div></div>
+            <div class="step"><span class="num">2</span><div class="txt">Land identity fields (owner, khasra, area, dates...) are parsed out automatically.</div></div>
+            <div class="step"><span class="num">3</span><div class="txt">Duplicate & consistency checks run — clean records auto-verify, flagged ones need review.</div></div>
+            <div class="step"><span class="num">4</span><div class="txt">Everything lands in your <b>Dashboard</b>, ready to double-check.</div></div>
           </div>
         </div>
       </section>
@@ -864,12 +866,12 @@
           </div>
           <div class="upload-side-note">
             <h4>⚙️ What happens next</h4>
-            <div class="step"><span class="num">1</span> Your document is OCR-scanned and your land details (owner, khasra, area...) are auto-read.</div>
-            <div class="step"><span class="num">2</span> It's placed in the Revenue Officer's queue with a fixed deadline for physical inspection.</div>
-            <div class="step"><span class="num">3</span> The officer visits / calls to confirm ownership, area, and boundaries in person.</div>
-            <div class="step"><span class="num">4</span> Once confirmed, it's marked <b>Verified</b> with the officer's name — visible to you under <b>My Submissions</b>.</div>
-            <div class="step"><span class="num">5</span> If two people claim the same land, both are held for verification — no submission is fast-tracked over another.</div>
-            <div class="step"><span class="num">6</span> If the deadline is missed, your case is automatically escalated to a senior authority.</div>
+            <div class="step"><span class="num">1</span><div class="txt">Your document is OCR-scanned and your land details (owner, khasra, area...) are auto-read.</div></div>
+            <div class="step"><span class="num">2</span><div class="txt">It's placed in the Revenue Officer's queue with a fixed deadline for physical inspection.</div></div>
+            <div class="step"><span class="num">3</span><div class="txt">The officer visits / calls to confirm ownership, area, and boundaries in person.</div></div>
+            <div class="step"><span class="num">4</span><div class="txt">Once confirmed, it's marked <b>Verified</b> with the officer's name and visible to you under <b>My Submissions</b>.</div></div>
+            <div class="step"><span class="num">5</span><div class="txt">If two people claim the same land, both are held for verification. No submission is fast-tracked over another.</div></div>
+            <div class="step"><span class="num">6</span><div class="txt">If the deadline is missed, your case is automatically escalated to a senior authority.</div></div>
           </div>
         </div>
       </section>
