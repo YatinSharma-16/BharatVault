@@ -2157,10 +2157,12 @@
     }
 
     // ---------------- OCR Accuracy Calculator ----------------
-    // Compares what OCR originally extracted (baseline, captured the first time a record is opened)
-    // with what the officer finally submits. Every correction counts as an OCR error.
-    //   Field accuracy     = fields left unchanged / fields that have a value
-    //   Character accuracy = 1 - (Levenshtein edits / longer string), summed over all fields
+    // Measures how much of the data in the deed OCR was actually able to extract.
+    //   baseline = what OCR originally returned (captured the first time a record is opened)
+    //   current  = what the officer finally submits (the complete data of the deed)
+    //   Extraction rate = fields OCR returned a value for / fields that hold data
+    // A field the OCR left empty (and the officer had to type in) counts as NOT extracted.
+    // A field that is empty both in OCR and in the final form has no data, so it is ignored.
     const OCR_FIELDS = [
       ["edit-district", "District"], ["edit-tehsil", "Tehsil"], ["edit-village", "Village"],
       ["edit-khasra", "Khasra No."], ["edit-khata", "Khata No."], ["edit-plot", "Plot No."],
@@ -2195,22 +2197,16 @@
 
     // baseline / current: { inputId: value }
     function computeOcrAccuracy(baseline, current) {
-      let total = 0, correct = 0, dist = 0, denom = 0;
-      const changes = [];
+      let total = 0, extracted = 0;
+      const missed = [];
       for (const [id, label] of OCR_FIELDS) {
         const a = ocrNorm(id, baseline[id]), b = ocrNorm(id, current[id]);
-        if (a === "" && b === "") continue;          // nothing there, nothing to judge
+        if (a === "" && b === "") continue;          // no data in this field at all
         total++;
-        denom += Math.max(a.length, b.length);
-        if (a === b) { correct++; continue; }
-        dist += levenshtein(a, b);
-        changes.push({ label, from: a, to: b });
+        if (a !== "") extracted++;                   // OCR returned something for it
+        else missed.push({ label, to: b });          // OCR found nothing, officer filled it in
       }
-      return {
-        total, correct, dist, denom, changes,
-        fieldAcc: total ? correct / total : null,
-        charAcc: denom ? 1 - dist / denom : null
-      };
+      return { total, extracted, missed, rate: total ? extracted / total : null };
     }
 
     function readReviewForm() {
@@ -2260,12 +2256,11 @@
     }
 
     function ocrOverall() {
-      const hist = ocrLoad("bv_ocr_history") || {};
+      const hist = ocrLoad("bv_ocr_history_v2") || {};
       const rows = Object.values(hist);
       if (!rows.length) return null;
-      const t = rows.reduce((s, r) => s + r.total, 0), c = rows.reduce((s, r) => s + r.correct, 0);
-      const d = rows.reduce((s, r) => s + r.dist, 0), n = rows.reduce((s, r) => s + r.denom, 0);
-      return { records: rows.length, fieldAcc: t ? c / t : null, charAcc: n ? 1 - d / n : null };
+      const t = rows.reduce((s, r) => s + r.total, 0), e = rows.reduce((s, r) => s + r.extracted, 0);
+      return { records: rows.length, rate: t ? e / t : null, extracted: e, total: t };
     }
 
     function pct(x) { return x == null ? "-" : (x * 100).toFixed(1) + "%"; }
@@ -2276,21 +2271,21 @@
       if (!el) return;
       const overall = ocrOverall();
       const overallHtml = overall
-        ? `<div class="ocr-acc-overall">Overall across ${overall.records} reviewed record${overall.records > 1 ? "s" : ""}: <b>${pct(overall.fieldAcc)}</b> fields · <b>${pct(overall.charAcc)}</b> characters</div>` : "";
+        ? `<div class="ocr-acc-overall">Overall across ${overall.records} reviewed record${overall.records > 1 ? "s" : ""}: <b>${pct(overall.rate)}</b> of data extracted (${overall.extracted}/${overall.total} fields)</div>` : "";
       if (!ocrBaseline) {
         el.innerHTML = `<div class="ocr-acc-title">🎯 OCR Accuracy</div>
-          <div class="ocr-acc-note">No original OCR snapshot for this record - it was already verified before tracking began. Upload a new deed and correct it before approving to see accuracy.</div>${overallHtml}`;
+          <div class="ocr-acc-note">No original OCR snapshot for this record - it was already verified before tracking began. Upload a new deed to see how much data OCR extracts.</div>${overallHtml}`;
         return;
       }
       const r = computeOcrAccuracy(ocrBaseline, readReviewForm());
-      const col = accColor(r.fieldAcc);
-      const changes = r.changes.slice(0, 6).map(c =>
-        `<div class="ocr-acc-change"><b>${escapeHtml(c.label)}</b>: <s>${escapeHtml(shortText(c.from || "(empty)", 28))}</s> → ${escapeHtml(shortText(c.to || "(empty)", 28))}</div>`).join("");
-      el.innerHTML = `<div class="ocr-acc-title">🎯 OCR Accuracy <span style="color:${col};">${pct(r.fieldAcc)}</span>
-          <span class="ocr-acc-sub">field-level · ${r.correct}/${r.total} fields correct · ${pct(r.charAcc)} character-level</span></div>
-        <div class="ocr-acc-bar"><div style="width:${r.fieldAcc == null ? 0 : r.fieldAcc * 100}%; background:${col};"></div></div>
-        ${changes || '<div class="ocr-acc-note">No corrections made - OCR output matches your final values.</div>'}
-        ${r.changes.length > 6 ? `<div class="ocr-acc-note">+ ${r.changes.length - 6} more corrections</div>` : ""}
+      const col = accColor(r.rate);
+      const missed = r.missed.slice(0, 6).map(c =>
+        `<div class="ocr-acc-change"><b>${escapeHtml(c.label)}</b>: not extracted by OCR${c.to ? " → " + escapeHtml(shortText(c.to, 28)) : ""}</div>`).join("");
+      el.innerHTML = `<div class="ocr-acc-title">🎯 OCR Accuracy <span style="color:${col};">${pct(r.rate)}</span>
+          <span class="ocr-acc-sub">${r.extracted}/${r.total} fields extracted from the deed</span></div>
+        <div class="ocr-acc-bar"><div style="width:${r.rate == null ? 0 : r.rate * 100}%; background:${col};"></div></div>
+        ${missed || '<div class="ocr-acc-note">OCR extracted every field that holds data.</div>'}
+        ${r.missed.length > 6 ? `<div class="ocr-acc-note">+ ${r.missed.length - 6} more fields not extracted</div>` : ""}
         ${overallHtml}`;
     }
 
@@ -2298,9 +2293,9 @@
     function recordOcrAccuracy(id) {
       if (!ocrBaseline) return;
       const r = computeOcrAccuracy(ocrBaseline, readReviewForm());
-      const hist = ocrLoad("bv_ocr_history") || {};
-      hist[id] = { total: r.total, correct: r.correct, dist: r.dist, denom: r.denom, ts: Date.now() };
-      ocrStore("bv_ocr_history", hist);
+      const hist = ocrLoad("bv_ocr_history_v2") || {};
+      hist[id] = { total: r.total, extracted: r.extracted, ts: Date.now() };
+      ocrStore("bv_ocr_history_v2", hist);
     }
 
     let gisRedrawTimer = null;
