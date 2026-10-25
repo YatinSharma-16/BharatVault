@@ -4,7 +4,7 @@
 
 Land records in Rajasthan are scattered across different government portals, in different formats, and often as blurry scans or handwritten pages. Checking one plot can mean visiting several offices and comparing documents by hand, which is slow, easy to get wrong, and a good place for fraud to hide.
 
-BharatVault is our attempt to fix that. You upload a scanned record, the system reads it, checks it against rules and other sources, and puts everything into one clean, searchable record linked to a map. A human officer still makes the final call.
+BharatVault is our attempt to fix that. You upload a scanned record, the system reads it, checks it against rules, and puts everything into one clean, searchable record linked to a map. A human officer still makes the final call.
 
 Built by **Team ByteBusters** for **Hack for Social Cause 2027** (Governance & Civic Technology, Rajasthan).
 
@@ -12,18 +12,18 @@ Built by **Team ByteBusters** for **Hack for Social Cause 2027** (Governance & C
 
 ## What it does
 
-- **Reads scanned documents.** Jamabandi scans, registration deeds, handwritten records and cadastral maps, in Hindi, English and many other languages.
-- **Cleans up the image first.** Denoising, de-skewing and contrast fixes with OpenCV so the OCR has a fair chance.
-- **Pulls out the important fields.** Owner name, khata, khasra, area, land type and so on, then maps them into one standard format.
-- **Checks the record.** Rule-based checks flag missing data, inconsistencies and suspicious patterns, and the record is cross-checked against sources like Apna Khata, e-Panjiyan and Bhu-Naksha.
-- **Keeps a human in the loop.** Low-confidence fields go to a reviewer who can correct them. Nothing is final until an authorized officer approves it.
-- **Shows it on a map.** Verified records are linked to a Leaflet map with a cadastral overlay, and you can download a PDF summary.
+- **Reads scanned documents.** Jamabandi scans, registration deeds and other land records, mainly in Hindi and English.
+- **Cleans up the image first.** Denoising and contrast fixes with OpenCV so the OCR has a fair chance.
+- **Pulls out the important fields.** Owner name, khasra, khata, area, land use and so on, in both the original language and English.
+- **Checks the record.** Rule-based checks flag missing data, inconsistencies and suspicious patterns, and a timeline view follows the chain of ownership.
+- **Keeps a human in the loop.** Citizens can submit documents, clerks and revenue officers review them, and admins manage users and audit logs. Nothing is final until an officer approves it.
+- **Shows it on a map.** Records are linked to a Leaflet map built on OpenStreetMap.
 
 ## How it fits together
 
 ```
 Document upload  ->  Preprocessing (OpenCV)  ->  OCR (PaddleOCR)
-      ->  Field extraction (Transformers / LLM)  ->  Validation & cross-check
+      ->  Field extraction (local rules, optional Gemini)  ->  Validation
       ->  Human review & approval  ->  Unified record + map view
 ```
 
@@ -31,24 +31,21 @@ Document upload  ->  Preprocessing (OpenCV)  ->  OCR (PaddleOCR)
 
 | Part | What we use |
 |---|---|
-| Core | Python |
-| Image processing | OpenCV |
-| OCR | PaddleOCR (100+ languages) |
-| Field extraction & validation | Transformers / LLM |
-| Storage | PostgreSQL in the full design, a local `tera-digi.db` file when running on your machine |
-| Maps | Leaflet |
+| Backend | Python, FastAPI, Uvicorn |
+| Login | JWT tokens (python-jose) |
+| Image & PDF handling | OpenCV, Pillow, PyMuPDF |
+| OCR | PaddleOCR (Tesseract as an optional fallback) |
+| Field extraction | Built-in local rules, with optional Google Gemini |
+| Storage | SQLite file (`terra_digitize.db`) in this build, PostgreSQL in the full design |
+| Frontend | Single `index.html` page with Leaflet and OpenStreetMap |
 
 ---
 
 ## Languages
 
-BharatVault is built primarily for Hindi and English. It also supports other languages like Marathi and Bengali, and you can pick which ones to load with the OCR_LANGUAGES setting (see below).
+BharatVault is built primarily for **Hindi and English**, and that's what the OCR and field extraction are tuned for. Support for other languages like **Marathi** and **Bengali** is planned. PaddleOCR can load other language models through the `PADDLE_OCR_LANG` setting, but we haven't tuned the extraction rules for them yet.
 
-A few honest notes:
-
-- Documents that mix English with a regional language (very common in land records) are fine.
-- Accuracy is not the same for every language. Scripts with fewer training examples, and handwriting, will do worse than printed English. That is why the human review step stays in the loop.
-- The exact language codes and the full list depend on the PaddleOCR version you have installed, so check the [PaddleOCR docs](https://github.com/PaddlePaddle/PaddleOCR) for the codes available to you.
+Records that mix Hindi and English on the same page are fine. Accuracy isn't the same for every document, and handwriting is harder than print. That's why the human review step stays in the loop.
 
 ---
 
@@ -58,14 +55,18 @@ A few honest notes:
 
 - Python 3.9 or newer
 - Git
-- A few GB of free disk space (the OCR models are not small)
+- An internet connection the first time you run it (OCR models get downloaded) and whenever you use the map
+- A few GB of free disk space
 
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/YatinSharma-16/BharatVault
+git clone https://github.com/YatinSharma-16/BharatVault.git
 cd BharatVault
+cd "Source Code"
 ```
+
+Everything below is run from inside the `Source Code` folder, next to `main.py` and `index.html`.
 
 ### 2. Make a virtual environment
 
@@ -85,78 +86,109 @@ venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 4. Set up your environment variables
+This installs PaddleOCR, so it can take a few minutes.
 
-Copy the example file and fill in your own values:
-
-```bash
-cp .env.example .env
-```
-
-See the next section for what each variable does.
-
-### 5. Run it
+### 4. Start the server
 
 ```bash
-python app.py
+uvicorn main:app --reload
 ```
 
-Then open http://127.0.0.1:8000 in your browser.
+### 5. Open the site
+
+Go to **http://127.0.0.1:8000** in your browser.
+
+To log in the first time, use the default admin account:
+
+- **Username:** `admin`
+- **Password:** `admin123`
+
+Please change that password before sharing the app with anyone (see [Before you deploy](#before-you-deploy)).
 
 ---
 
 ## Environment variables
 
-Create a `.env` file in the project root. It should look something like this:
+Good news: you don't need any to get started. BharatVault runs fine with the defaults.
 
-```env
-SECRET_KEY=change-this-to-something-long-and-random
-DATABASE_PATH=./tera-digi.db
-LLM_API_KEY=your-api-key-here
-OCR_LANGUAGES=hi,en
-PORT=5000
-DEBUG=True
+If you want to change something, set the variable in your terminal **before** starting the server. The app doesn't read a `.env` file.
+
+```bash
+# macOS / Linux
+export GEMINI_API_KEY=your-key-here
+
+# Windows PowerShell
+$env:GEMINI_API_KEY="your-key-here"
+
+# Windows Command Prompt
+set GEMINI_API_KEY=your-key-here
 ```
 
-| Variable | What it's for | Required? |
+| Variable | What it's for | Default |
 |---|---|---|
-| `SECRET_KEY` | Secret used to sign sessions and protect the app. Use a long random string. | Yes |
-| `DATABASE_PATH` | Where the local database file lives. Defaults to `./tera-digi.db`. | No |
-| `LLM_API_KEY` | API key for the model that handles field extraction and validation. | Yes |
-| `OCR_LANGUAGES` | Comma-separated language codes PaddleOCR should load, e.g. `hi,en` or `hi,en,mr,bn,ta`. Any language PaddleOCR supports works here. More languages means more models to download and a bit more memory. | No |
-| `PORT` | Port the app runs on. | No |
-| `DEBUG` | Turns on debug mode. Keep it `False` anywhere public. | No |
+| `GEMINI_API_KEY` | Optional. If set, Google Gemini helps read documents and normalise the fields. If not, the built-in local extraction is used. | not set |
+| `OCR_ENGINE` | Which OCR engine to use: `paddle` or `tesseract`. | `paddle` |
+| `PADDLE_OCR_LANG` | Language model PaddleOCR loads. If it isn't available, the app falls back to `hi` and then `en`. | `devanagari` |
+| `TESSERACT_LANG` | Language codes for Tesseract. Only used when `OCR_ENGINE=tesseract`. | `hin+eng` |
+| `MAX_OCR_PAGES` | Maximum number of pages read from a single PDF. | `6` |
+| `PADDLE_DOC_ORIENTATION` | Set to `1` to detect and fix page rotation. | `0` |
+| `PADDLE_ENABLE_MKLDNN` | Set to `1` to turn on Intel MKLDNN acceleration. It's off by default because it can crash on some Windows setups. | `0` |
 
-**Please don't commit your `.env` file.** It has your secrets in it. Make sure `.env` is listed in your `.gitignore`.
+**Never put real API keys in the code or commit them to GitHub.**
+
+### Using Tesseract instead of PaddleOCR (optional)
+
+1. Install the Tesseract program on your computer, with Hindi language data.
+2. In `requirements.txt`, remove the `#` in front of `pytesseract` and `pdf2image`, then run `pip install -r requirements.txt` again.
+3. Set `OCR_ENGINE=tesseract` and start the server.
 
 ---
 
-## Important: the `tera-digi.db` file
+## Important: the `terra_digitize.db` file
 
-When you run BharatVault locally, it creates a file called **`tera-digi.db`**. This is the local database where your records, review status and history are stored, and **the app will not run without it.**
+The first time you start BharatVault, it creates a database file called **`terra_digitize.db`**. This is where users, records, review status and audit logs are stored, and the app depends on it to run locally. It also creates an `uploads/` folder for the documents people upload.
 
 A few things worth knowing:
 
-- It's created automatically the first time you start the app, so you don't need to make it yourself.
-- Leave it in the project root (or wherever `DATABASE_PATH` points). If the app can't find it, it won't start.
-- Don't delete it unless you're fine losing your local data. If it does get deleted or corrupted, stop the app and start it again so a fresh one is created.
-- Treat it like any other local data file. It can contain land record details, so don't share it or push it to a public repo.
+- It's created automatically, so you don't need to make it yourself.
+- The path is relative, so **always start the server from the same folder** (`Source Code`). If you start it from somewhere else, you'll get a brand new empty database and it will look like your data and logins vanished.
+- If you delete it, you start fresh: all records and users are gone, and only the default admin account comes back.
+- It holds land record details and login data, so don't share it. Keep `terra_digitize.db` and `uploads/` out of Git by adding them to your `.gitignore`.
 
 ---
 
 ## Troubleshooting
 
-**The app crashes on startup.**
-Check that `tera-digi.db` exists and that `DATABASE_PATH` in your `.env` points to the right place.
+**I see "index.html not found next to main.py".**
+You started the server from the wrong folder. Go into `Source Code` and run `uvicorn main:app --reload` again.
+
+**My data or login disappeared.**
+Most likely you started the server from a different folder, so a new `terra_digitize.db` was created. Go back to the original folder.
 
 **The first OCR run is really slow.**
-That's normal. PaddleOCR downloads its language models the first time, so it needs an internet connection and a bit of patience. After that it's much faster.
+That's normal. PaddleOCR downloads its models the first time, so it needs internet and a bit of patience. After that it's much faster.
+
+**PaddleOCR crashes on Windows.**
+Make sure `PADDLE_ENABLE_MKLDNN` is not set to `1`.
+
+**The map is blank.**
+The map loads Leaflet and OpenStreetMap tiles from the internet, so check your connection.
 
 **Hindi text looks wrong or has missing characters.**
-OCR accuracy depends a lot on scan quality. Blurry, faded or skewed scans do worse, and handwritten records are the hardest. This is exactly why we have the human review step. Try a cleaner scan if you can.
+OCR accuracy depends a lot on scan quality. Blurry, faded or skewed scans do worse, and handwritten records are the hardest. Try a cleaner scan if you can, and use the review step to correct the fields.
 
 **`pip install` fails on a package.**
 Update pip first (`python -m pip install --upgrade pip`) and make sure you're inside your virtual environment.
+
+---
+
+## Before you deploy
+
+BharatVault is currently set up for local use and demos. Before putting it on a public server:
+
+- Change the default `admin` / `admin123` login.
+- Replace the `SECRET_KEY` that's hardcoded in `main.py` with your own secret.
+- Restrict the CORS settings in `main.py`, which currently allow requests from any origin.
 
 ---
 
@@ -183,4 +215,8 @@ Registration ID: `HSC|RJ|00091`
 
 ## A note on accuracy
 
-OCR accuracy is only a preliminary estimate right now. English comes out best, and regional scripts and handwriting are harder. BharatVault is meant to assist officers and citizens, not replace official verification. Always confirm important records with the relevant government office.
+OCR accuracy is only a preliminary estimate right now. English comes out best, and Hindi and handwriting are harder. BharatVault is meant to assist officers and citizens, not replace official verification. Always confirm important records with the relevant government office.
+
+---
+
+Made with a lot of chai in Rajasthan. If you find a bug or have an idea, open an issue. We'd love to hear it.
