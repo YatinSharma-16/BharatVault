@@ -63,8 +63,8 @@ A few honest notes:
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/YatinSharma-16/HSC2026.git
-cd HSC2026
+git clone https://github.com/YatinSharma-16/BharatVault
+cd BharatVault
 ```
 
 ### 2. Make a virtual environment
@@ -101,7 +101,7 @@ See the next section for what each variable does.
 python app.py
 ```
 
-Then open **http://localhost:5000** in your browser (or whatever `PORT` you set).
+Then open http://127.0.0.1:8000 in your browser.
 
 ---
 
@@ -184,7 +184,3 @@ Registration ID: `HSC|RJ|00091`
 ## A note on accuracy
 
 OCR accuracy is only a preliminary estimate right now. English comes out best, and regional scripts and handwriting are harder. BharatVault is meant to assist officers and citizens, not replace official verification. Always confirm important records with the relevant government office.
-
----
-
-Made with a lot of chai in Rajasthan. If you find a bug or have an idea, open an issue. We'd love to hear it.
