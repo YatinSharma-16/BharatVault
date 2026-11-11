@@ -1,0 +1,3 @@
+This folder contains sample records used to test the OCR module.
+The records have been translated into Tamil to evaluate how accurately and efficiently the OCR extracts data from Tamil-language documents.
+These files are for testing and validation only and should not be treated as production data.
