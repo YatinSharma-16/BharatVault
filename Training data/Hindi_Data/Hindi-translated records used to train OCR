@@ -1,0 +1,3 @@
+This folder contains sample records used to train the OCR module.
+The records are in Hindi so the model can learn to recognize Devanagari text and extract data from Hindi-language documents accurately.
+These files are for training purposes only, and the data kept separate from the testing folder so that evaluation results stay unbiased.
