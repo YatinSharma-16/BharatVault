@@ -1,0 +1,3 @@
+This folder contains sample records used to test the OCR module.
+Records are in English-language to test efficiency of OCR to extract data from English records.
+These files are for testing and validation only and should not be treated as production data.
